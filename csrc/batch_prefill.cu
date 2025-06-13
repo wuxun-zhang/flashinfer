@@ -40,6 +40,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
 using namespace flashinfer;
 
+// wuxun: batch prefill plan entry
 at::Tensor BatchPrefillWithKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
@@ -194,6 +195,7 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
       });
 }
 
+// wuxun: batch prefill with pagged KV cache RUN entry
 void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
                                      at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
                                      at::Tensor q, at::Tensor paged_k_cache,
@@ -251,6 +253,8 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
       RaggedParams, PagedParams, [&] {
         PagedParams params;
 
+        // wuxun: populate all runtime information (qkv tensor address) and
+        // cached plan info into params.
         params.q = static_cast<DTypeQ*>(q.data_ptr());
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,
@@ -287,6 +291,7 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
 
+        // wuxun: retrive plan info from PrefillInfo device workspace memory
         params.request_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
         params.qo_tile_indices =

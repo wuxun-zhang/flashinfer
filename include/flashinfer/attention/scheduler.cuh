@@ -99,10 +99,13 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
                                            const uint32_t min_kv_chunk_size = 1) {
   const int64_t batch_size = packed_qo_len_arr.size();
   int64_t max_kv_len = 1;
+  // wuxun: find max kv length among batch
   for (const int64_t& kv_len : kv_len_arr) {
     max_kv_len = std::max(max_kv_len, kv_len);
   }
 
+  // wuxun: find kv chunk size to make batch_size as large as possible but should
+  // not exceed max_batch_size_if_split
   int64_t low = min_kv_chunk_size;
   int64_t high = max_kv_len;
   constexpr int64_t min_kv_len = 1;
@@ -110,6 +113,7 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
     const int64_t mid = (low + high) / 2;
     int64_t new_batch_size = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
+      // wuxun: ??? new batch size is total number of work units for all request
       new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
                         ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
     }
@@ -500,6 +504,10 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   // step 1: determine packed_qo_len_arr and verify qo_indptr contents.
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
+    // wuxun: qo_length packed with head fusion (GQA group size)
+    // a group of query heads attends to a single KV head.
+    // query: [B, H, S, D] -> [B, h_G*G, S, D] -> [B*G, h_G, S, D]
+    // kv: [*, h_G, S, D]
     packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
     if (packed_qo_len_arr[i] < 0) {
       std::ostringstream err_msg;
@@ -507,6 +515,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
               << qo_indptr_h[i] << " should be non-negative";
       FLASHINFER_ERROR(err_msg.str());
     }
+    // wuxun: paged KV cache
     kv_len_arr[i] = int64_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
     if (kv_len_arr[i] < 0) {
       std::ostringstream err_msg;
@@ -543,10 +552,12 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
 
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
+      // wuxun: calculate total number of Q tiles
       total_num_tiles_q += ceil_div(packed_qo_len_arr[i], cta_tile_q);
     }
   }
 
+  // wuxun: device whether to split KV and chunk size of kv cache
   auto [split_kv, kv_chunk_size] =
       PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr,
                                      kv_len_arr, cta_tile_q, min_kv_chunk_size);
@@ -561,6 +572,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
 
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
+        // Wuxun: batch size is indeed total number of work units
         new_batch_size += 1;
         request_indices.push_back(request_idx);
         qo_tile_indices.push_back(q_tile_idx);
@@ -581,6 +593,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                    "new batch size should not exceed padded batch size");
 
   // step 4: multiply kv_chunk_size by page_size
+  // wuxun: kv_indptr_h is in terms of pages, so we need to multiply by page_size
   kv_chunk_size *= page_size;
 
   return std::make_tuple(split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
@@ -687,8 +700,10 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  // wuxun: why 2 blocks per SM?
   int num_blocks_per_sm = 2;
   int max_grid_size = num_blocks_per_sm * num_sm;
+  // Wuxun: assume a thread block process a batch per KV head
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size
@@ -704,9 +719,12 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   plan_info.padded_batch_size = padded_batch_size;
   plan_info.split_kv = split_kv;
 
+  // wuxun: device memory
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+  // wuxun: mapping work units back to original batch/request
   plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * padded_batch_size, 16, "batch_prefill_request_indices");
+  // wuxun: mapping work units back to original qo tile
   plan_info.qo_tile_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * padded_batch_size, 16, "batch_prefill_qo_tile_indices");
   plan_info.kv_tile_indices_offset = int_allocator.aligned_alloc_offset(
@@ -724,6 +742,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
     *total_num_rows_h = qo_indptr_h[batch_size];
   }
 
+  // wuxun: host pinned memory for request indices, qo tile indices, kv tile indices,
   IdType* request_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
   IdType* qo_tile_indices_h =
@@ -741,6 +760,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   kv_chunk_size_ptr_h[0] = kv_chunk_size;
 
   if (split_kv) {
+    // wuxun: kv cache is split, and it needs extra works after partial attention
+    // results generated.
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
@@ -763,12 +784,14 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   }
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
+  // wuxun: copy to device memory from pinned memory
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
 
   return cudaSuccess;
 }
 
+// wuxun: cost function
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
 
 template <typename T>

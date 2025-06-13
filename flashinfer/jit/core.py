@@ -105,6 +105,8 @@ class JitSpec:
     def build_and_load(self):
         verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
         self.build(verbose)
+        # Wuxun: load library to trigger global initialization and
+        # custom op registration
         torch.ops.load_library(self.library_path)
         return getattr(torch.ops, self.name)
 
@@ -184,6 +186,9 @@ def build_jit_specs(specs: List[JitSpec], verbose: bool) -> None:
         run_ninja(FLASHINFER_JIT_DIR, ninja_path, verbose)
 
 
+# Wuxun: this is called when custom op source file is changed and need to be
+# recompiled. Re-generate Ninja file firstly and then compile to shared library,
+# finally load this new shared library to register the custom op.
 def load_cuda_ops(
     name: str,
     sources: List[Union[str, Path]],

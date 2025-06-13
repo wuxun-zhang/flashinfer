@@ -31,6 +31,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
 
 using namespace flashinfer;
 
+// Wuxun: entry point for custom single prefill CUDA ops
 void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                        at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                        int64_t mask_mode_code, int64_t layout,
