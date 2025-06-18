@@ -432,15 +432,25 @@ __device__ __forceinline__ void load_q_global_smem(
   constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
   const uint32_t lane_idx = tid.x, warp_idx_x = get_warp_idx_q<KTraits>(tid.y);
 
+  // wuxun: only first KV warp to load q/k/v from gmem to smem
   if (get_warp_idx_kv<KTraits>(tid.z) == 0) {
+    // wuxun: load q fragment of size [4, 8]
     uint32_t q_smem_offset_w = q_smem->get_permuted_offset<UPCAST_STRIDE_Q>(
         warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
 
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      // wuxun: for each MMA_Q, will load 4 * [4 * 8] submatrix from gmem to
+      // smem, combining to a bigger [8, 16] fragment
+      // for each warp, it will load [8, 16] blocks to smem
+      // totally 4 warps, it will load 2 x [16, 16] x (# of MMA_KV) submatrix to smem for later
+      // mma computtaion.
 #pragma unroll
       for (uint32_t j = 0; j < 2 * 2; ++j) {
         uint32_t q, r;
+        // wuxun: group size = num_q_heads / num_kv_heads
+        // q: query seq index
+        // r: head index inside a group
         group_size.divmod(packed_offset + lane_idx / 8 + mma_q * 16 + j * 4, q, r);
         const uint32_t q_idx = q;
         DTypeQ* q_ptr =
@@ -610,6 +620,7 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
   }
 }
 
+// wuxun: Q@K computation
 template <typename KTraits>
 __device__ __forceinline__ void compute_qk(
     smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
@@ -2001,6 +2012,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 #endif
 }
 
+// wuxun: device kernel entry for batched prefill paged KV cache
 template <typename KTraits, typename Params>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const Params params, typename KTraits::SharedStorage& smem_storage, const dim3 tid = threadIdx,
@@ -2501,7 +2513,15 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
+  // wuxun: num of MMA assigned to process query dimension
+  // CTA_TILE_Q is up to 128:
+  //   - if TILE_Q > 64, need 2 MMAs + 4 warps (16 elements each) to load
+  //     all submatrix (16x16) to smem
+  //   - if 16 < TILE_Q < 64, only need 1 MMAs + 4 warps (16 elements each) to
+  //     load all submatrix (16x16).
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
+  // wuxun: make sure totally 4 warps in a thread block
+  // totally 2 thread blocks in a SM
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
 
@@ -2511,9 +2531,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     return cudaSuccess;
   }
 
+  // wuxun: one block per work unit per kv head
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
+  // wuxun: block dim - (warp_size, num_warps_q, num_warps_kv)
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
 
+  // wuxun: each mma handle 16x16 matrix
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using DTypeQKAccum =
@@ -2526,6 +2549,15 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
   // we expect each sm execute two threadblocks
+  //
+  // wuxun: smem required for attention computation
+  //  Q@K: fetch Q tile into smem - TILE_Q * HEAD_DIM_Q
+  //       fetch K tile into smem, each warp process 16 tokens with HEAD_DIM_K
+  //                  - NUM_WARPS_KV * 16 * HEAD_DIM_K
+  //  softmax on smem
+  //  @V: fetch V tile into smem, each warp process 16 tokens with HEAD_DIM_K
+  //                  - num_WARPS_KV * 16 * HEAD_DIM_V
+  // directly write final outputs to gmem
   const int num_ctas_per_sm =
       max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
                               (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))

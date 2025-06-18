@@ -320,6 +320,7 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
 
         cudaError_t status = cudaSuccess;
 
+        // wuxun: dispatch according to CTA_TILE_Q
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
